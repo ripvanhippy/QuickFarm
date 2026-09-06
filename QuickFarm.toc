@@ -1,0 +1,9 @@
+## Interface: 11200
+## Title: |cffff8000<Gaha>|r |cff006400QuickFarm|r
+## Notes: Auto-swaps gear when a "Requires Skinning ###" or "Requires Mining ###" skill error appears, and safely swaps back after looting (combat-aware, with timeout failsafe).
+## Author: You
+## Version: 1.1
+## SavedVariablesPerCharacter: QuickFarmDB
+
+Core.lua
+UI.lua
