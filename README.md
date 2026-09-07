@@ -59,6 +59,37 @@ loadout.
 
 ---
 
+## Two-handed weapons vs offhand swap (fixed)
+
+The server refuses to equip anything into the offhand slot while a
+two-handed weapon occupies the mainhand slot - it has to be empty first,
+and that emptying is a server round-trip, not instant.
+
+`QuickFarm_EquipOffhandSafely()` in `Core.lua` handles this automatically
+any time the offhand slot is touched (forward swap AND the retry safety
+net):
+
+1. Check the currently-equipped mainhand item's `itemEquipLoc` via
+   `GetItemInfo`. If it's `"INVTYPE_2HWEAPON"`, the offhand slot is blocked.
+2. If blocked: snapshot the mainhand item's name (so it can be restored
+   later, exactly like any other slot), unequip it to the bags, then call
+   `QuickFarm_WaitForSlotEmpty()` - a poll loop (every 0.2s, up to 15 tries
+   / ~3s) that only proceeds once `GetInventoryItemLink` for the mainhand
+   slot actually comes back empty - i.e. the server has confirmed it, not
+   just "we sent the command". Only then is the offhand item equipped.
+3. If not blocked (mainhand is empty or a one-hander): equip the offhand
+   item immediately, no waiting needed.
+
+Because the borrowed mainhand snapshot is stored under the normal
+`pending.slots["mainhand"]` key, `QuickFarm_DoBackwardSwap()` restores the
+two-hander afterward with no extra code - it doesn't know or care that
+"mainhand" was never configured by the user for this particular swap.
+
+Both `QuickFarm_DoForwardSwap()` and `QuickFarm_RetrySlots()` now also walk
+slots in a fixed order (`gloves`, `mainhand`, `offhand`) instead of Lua's
+unordered `pairs()`, so mainhand is always resolved before offhand is ever
+touched.
+
 ## Combat safety (important failsafe)
 
 On this server, equipping gear during combat silently fails. To guard against
@@ -103,6 +134,31 @@ kept in memory. On login/reload, `PLAYER_ENTERING_WORLD` checks if
 `QuickFarmDB.pending.active` is still `true` from before — meaning you logged
 out or crashed while still wearing the swapped gear — and immediately
 attempts to restore it.
+
+## Skill pre-check (don't swap if it wouldn't be enough anyway)
+
+The error message itself tells us the required skill (e.g. `Requires Skinning
+305` → 305 is required). Before ever touching gear, the addon now checks if
+swapping would even reach that number:
+
+1. Read the player's current bare skill rank for that skill (Skinning or
+   Mining) via `GetSkillLineInfo` - with any bonus from gear worn *right now*
+   subtracted back out first.
+2. For every configured slot (gloves/mainhand/offhand) that has an item set,
+   scan that item's tooltip for a `+N Skinning` / `+N Mining` line (vanilla
+   has no direct API for this, so a hidden scanning tooltip reads the text).
+3. Add bare skill + all found bonuses = projected skill.
+4. If projected skill is still **below** the required number: don't swap at
+   all. Print a red error: `Did not swap - even with your gear you'd only
+   have Skinning 280/305.`
+5. If projected skill is enough: proceed with the normal forward swap.
+
+If the error fires again **while already swapped in** (`pending.active ==
+true`), that means the swap happened but still wasn't enough (e.g. a
+different/tougher mob). In that case the addon:
+- Prints a confirmation that the gear swap is currently active.
+- Prints a red error saying the skill is too low even with the gear equipped.
+- Immediately triggers the backward swap (no point staying in skinning gear).
 
 ## Manual override (extra safety net, not requested but cheap insurance)
 
@@ -153,7 +209,12 @@ popup — an unconfigured slot is simply not swapped.
 - `QuickFarm_InitDB()` — creates `QuickFarmDB` and all its sub-tables with defaults if missing. Called once on `ADDON_LOADED`.
 - `QuickFarm_CanOffhand()` — returns true only for Warrior/Rogue/Hunter (Shaman excluded: no Dual Wield talent on this server).
 - `QuickFarm_FindItemInBags(name)` — searches bags 0–4 for an item matching `name` (case-insensitive, exact match on the item's display name). Returns `found (bool), texture (string or nil)`.
-- `QuickFarm_IsSkinningSkillError(msg)` — returns true only for the pattern `"Requires Skinning <number>"`, explicitly excluding `"Requires Skinning Knife"` and anything else.
+- `QuickFarm_ParseSkillError(msg)` — returns `isMatch, skillName, required` for the pattern `"Requires Skinning/Mining <number>"`, explicitly excluding `"Requires Skinning Knife"` and anything else. `QuickFarm_IsSkinningSkillError(msg)` still exists as an old boolean-only wrapper around it.
+- `QuickFarm_GetProjectedSkill(skillName)` — returns `projected, base, bonus`: the player's bare skill rank plus the summed tooltip bonus of every configured slot item that grants that skill. Used to decide, BEFORE swapping, whether swapping would even be enough.
+- `QuickFarm_GetItemSkillBonus(itemLink, skillName)` (local) — scans an item's tooltip text (via a hidden `QuickFarmScanTooltip`) for a `+N <skillName>` line and returns the number, or 0 if none found.
+- `QuickFarm_GetSkillBase(skillName)` (local) — reads the player's current rank for a skill via `GetSkillLineInfo`, with any currently-worn gear bonus subtracted back out.
+- `QuickFarm_WaitForSlotEmpty(invSlot, callback, triesLeft)` — polls `GetInventoryItemLink` every 0.2s (up to 15 tries) and calls `callback()` once that slot is confirmed empty by the server. Prints an error and gives up if it never clears.
+- `QuickFarm_EquipOffhandSafely(itemName)` — the only safe way to equip into the offhand slot. Detects a 2H mainhand via `GetItemInfo`'s `itemEquipLoc`; if found, unequips it, waits via `QuickFarm_WaitForSlotEmpty`, then equips the offhand item; otherwise equips immediately. See "Two-handed weapons vs offhand swap (fixed)" above.
 - `QuickFarm_DoForwardSwap()` — the swap-in logic. Checks enabled/combat/already-pending, then for every configured slot: finds the item in bags (errors via `QuickFarm_Error` if missing), snapshots current equipped name, equips the configured item, marks `pending.active = true`, starts the timeout timer.
 - `QuickFarm_DoBackwardSwap()` — the swap-back logic. If in combat, just flags `pending.waiting = true` and stops. Otherwise restores every snapshotted slot (re-equips by name, or unequips-to-bag if the snapshot was `"EMPTY"`), then clears `pending`.
 - `QuickFarm_StartTimeoutTimer()` / `QuickFarm_CancelTimeoutTimer()` — control the 15s failsafe frame.
@@ -194,19 +255,38 @@ popup — an unconfigured slot is simply not swapped.
 
 ## Known limitations / things to watch
 
-- **Two-handed weapons vs offhand swap:** if the user wears a 2H weapon and
-  also configures an offhand skinning item, equipping into the offhand slot
-  while a 2H weapon occupies the mainhand can behave oddly (client-dependent).
-  Not specially handled — user should avoid configuring offhand swap while
-  using a 2H weapon.
 - **Exact name matching:** the typed item name must match the real item name
   exactly (case doesn't matter, but spelling does). No fuzzy matching or
   autocomplete yet.
 - **Locale:** the "Requires Skinning" text match assumes an English client.
+- **Tooltip bonus scanning:** the skill pre-check reads item tooltip text
+  (`+N Skinning`/`+N Mining`) to guess the bonus. If an item grants the bonus
+  through some other wording, or a buff/consumable is adding skill that
+  doesn't show as a gear modifier, the pre-check may be slightly off.
 
 ---
 
 ## Change log
+- v1.3 — Added the skill pre-check: before swapping, the addon now reads the
+  required skill number straight out of the error message
+  (`QuickFarm_ParseSkillError`), computes the player's bare skill rank plus
+  the tooltip `+N Skinning`/`+N Mining` bonus of every configured gear item
+  (`QuickFarm_GetProjectedSkill`, `QuickFarm_GetItemSkillBonus`,
+  `QuickFarm_GetSkillBase`), and refuses to swap at all if that total still
+  wouldn't be enough (prints a red error showing projected/required). If the
+  error fires again while already swapped in, the addon now confirms the
+  swap is active, prints an error that gear alone isn't enough, and swaps
+  back immediately instead of leaving the player stuck in skinning gear.
+  Per-character saved variables were already in place (`SavedVariablesPerCharacter`
+  in the `.toc`) — each character keeps its own gear/pending/minimap settings.
+- v1.2 — Fixed "Two-handed weapons vs offhand swap": added
+  `QuickFarm_EquipOffhandSafely()` and `QuickFarm_WaitForSlotEmpty()` in
+  `Core.lua`. Offhand equips now detect a 2H mainhand via `GetItemInfo`,
+  unequip it, poll (0.2s x up to 15 tries) until the server confirms the
+  mainhand slot is empty, then equip the offhand item; the borrowed
+  mainhand item is restored automatically on swap-back. Forward swap and
+  the retry safety net now walk slots in a fixed order
+  (`gloves`/`mainhand`/`offhand`) instead of relying on `pairs()`.
 - v0.1 — Initial build: detection via `UI_ERROR_MESSAGE`, forward/backward
   swap with per-attempt snapshotting, combat-safe swap-back with automatic
   retry on `PLAYER_REGEN_ENABLED`, 15s timeout failsafe, crash/relog

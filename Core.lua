@@ -128,20 +128,166 @@ local function QuickFarm_EquipItemByName(name, invSlot)
 end
 
 -- ------------------------------------------------------------
--- Detects the specific "skill too low" errors for Skinning and Mining.
+-- Generic short wait/poll helper (vanilla 1.12 has no C_Timer/After).
+-- Calls callback() once GetInventoryItemLink(invSlot) comes back empty,
+-- re-checking every QUICKFARM_POLL_INTERVAL seconds. Gives up after
+-- QUICKFARM_POLL_MAXTRIES tries (server lag safety net - never loops
+-- forever). Used only for the mainhand/offhand two-hander handshake below.
+-- ------------------------------------------------------------
+local QUICKFARM_POLL_INTERVAL = 0.2
+local QUICKFARM_POLL_MAXTRIES = 15 -- ~3 seconds total worst case
+local QuickFarmWaitFrame = CreateFrame("Frame", "QuickFarmWaitFrame")
+QuickFarmWaitFrame:Hide()
+
+local function QuickFarm_WaitForSlotEmpty(invSlot, callback, triesLeft)
+	triesLeft = triesLeft or QUICKFARM_POLL_MAXTRIES
+
+	if not GetInventoryItemLink("player", invSlot) then
+		-- Server has confirmed the slot is really empty now - safe to proceed.
+		callback()
+		return
+	end
+
+	if triesLeft <= 0 then
+		QuickFarm_Error("Mainhand did not clear in time (server lag?) - offhand swap aborted, try skinning again.")
+		return
+	end
+
+	local elapsed = 0
+	QuickFarmWaitFrame:SetScript("OnUpdate", function()
+		elapsed = elapsed + arg1
+		if elapsed >= QUICKFARM_POLL_INTERVAL then
+			QuickFarmWaitFrame:Hide()
+			QuickFarmWaitFrame:SetScript("OnUpdate", nil)
+			QuickFarm_WaitForSlotEmpty(invSlot, callback, triesLeft - 1)
+		end
+	end)
+	QuickFarmWaitFrame:Show()
+end
+
+-- ------------------------------------------------------------
+-- Safely equip the configured OFFHAND item. If a two-handed weapon is
+-- currently in the mainhand slot, the server will refuse to put anything
+-- in the offhand slot at all - so we must unequip the two-hander first,
+-- WAIT for the server to confirm the mainhand slot is truly empty (this
+-- is a round-trip, not instant - see README "Two-handed weapons vs
+-- offhand swap"), and only then equip the offhand item. The two-hander
+-- is snapshotted so QuickFarm_DoBackwardSwap puts it back automatically
+-- later, even though "mainhand" was never configured by the user.
+-- ------------------------------------------------------------
+local function QuickFarm_EquipOffhandSafely(itemName)
+	local mhSlot = QUICKFARM_SLOTID.mainhand
+	local ohSlot = QUICKFARM_SLOTID.offhand
+
+	local mainLink = GetInventoryItemLink("player", mhSlot)
+	local isTwoHander = false
+	if mainLink then
+		local _, _, _, _, _, _, _, _, equipLoc = GetItemInfo(mainLink)
+		isTwoHander = (equipLoc == "INVTYPE_2HWEAPON")
+	end
+
+	if isTwoHander then
+		if not QuickFarmDB.pending.slots["mainhand"] then
+			QuickFarmDB.pending.slots["mainhand"] = QuickFarm_GetEquippedName(mhSlot)
+		end
+		PickupInventoryItem(mhSlot)
+		PutItemInBackpack()
+		QuickFarm_WaitForSlotEmpty(mhSlot, function()
+			QuickFarmDB.pending.slots["offhand"] = QuickFarm_GetEquippedName(ohSlot)
+			QuickFarm_EquipItemByName(itemName, ohSlot)
+		end)
+	else
+		QuickFarmDB.pending.slots["offhand"] = QuickFarm_GetEquippedName(ohSlot)
+		QuickFarm_EquipItemByName(itemName, ohSlot)
+	end
+end
+
+-- ------------------------------------------------------------
+-- Detects the specific "skill too low" errors for Skinning and Mining,
+-- and pulls out WHICH skill and the required number.
 -- Matches:      "Requires Skinning 305"  /  "Requires Mining 305"
 -- Does NOT match: "Requires Skinning Knife"  (different problem, gear swap won't help)
 -- Does NOT match: "Out of range."
+-- Returns: isMatch (bool), skillName ("Skinning"/"Mining" or nil), required (number or nil)
 -- ------------------------------------------------------------
-function QuickFarm_IsSkinningSkillError(msg)
+function QuickFarm_ParseSkillError(msg)
 	if not msg then return false end
-	if string.find(msg, "^Requires Skinning %d") then
-		return true
+	local required = string.match(msg, "^Requires Skinning (%d+)")
+	if required then
+		return true, "Skinning", tonumber(required)
 	end
-	if string.find(msg, "^Requires Mining %d") then
-		return true
+	required = string.match(msg, "^Requires Mining (%d+)")
+	if required then
+		return true, "Mining", tonumber(required)
 	end
 	return false
+end
+
+-- Kept for backwards compatibility (old name, boolean-only version).
+function QuickFarm_IsSkinningSkillError(msg)
+	local isMatch = QuickFarm_ParseSkillError(msg)
+	return isMatch
+end
+
+-- ------------------------------------------------------------
+-- Skill pre-check: can we even reach the required skill by swapping?
+-- ------------------------------------------------------------
+
+-- Hidden tooltip used only to read the "+N Skinning/Mining" text off an
+-- item, since vanilla 1.12 has no direct API for item skill bonuses.
+local QuickFarmScanTooltip = CreateFrame("GameTooltip", "QuickFarmScanTooltip", nil, "GameTooltipTemplate")
+
+-- Reads the "Equip: +5 Skinning." (or similar) bonus off an item link's
+-- tooltip for the given skillName. Returns 0 if no such line is found.
+local function QuickFarm_GetItemSkillBonus(itemLink, skillName)
+	if not itemLink then return 0 end
+	QuickFarmScanTooltip:SetOwner(UIParent, "ANCHOR_NONE")
+	QuickFarmScanTooltip:SetHyperlink(itemLink)
+	local numLines = QuickFarmScanTooltip:NumLines()
+	for i = 1, numLines do
+		local fs = getglobal("QuickFarmScanTooltipTextLeft" .. i)
+		local text = fs and fs:GetText()
+		if text then
+			local bonus = string.match(text, "%+(%d+)%s+" .. skillName)
+			if bonus then
+				QuickFarmScanTooltip:Hide()
+				return tonumber(bonus)
+			end
+		end
+	end
+	QuickFarmScanTooltip:Hide()
+	return 0
+end
+
+-- Reads the player's CURRENT skill rank for skillName ("Skinning"/"Mining"),
+-- with any bonus from gear worn RIGHT NOW already subtracted back out -
+-- so this is the "bare" skill level with nothing equipped for it.
+local function QuickFarm_GetSkillBase(skillName)
+	for i = 1, GetNumSkillLines() do
+		local name, isHeader, _, rank, _, modifier = GetSkillLineInfo(i)
+		if not isHeader and name == skillName then
+			return (rank or 0) - (modifier or 0)
+		end
+	end
+	return 0
+end
+
+-- Adds up the bare skill + the tooltip bonus of every configured slot
+-- item (gloves/mainhand/offhand) that grants that skill.
+-- Returns: projected total, bare base, summed item bonus.
+function QuickFarm_GetProjectedSkill(skillName)
+	local base = QuickFarm_GetSkillBase(skillName)
+	local bonus = 0
+	for _, cfg in pairs(QuickFarmDB.slots) do
+		if cfg and cfg.itemName and cfg.itemName ~= "" then
+			local found, _, bag, slot = QuickFarm_FindItemInBags(cfg.itemName)
+			if found then
+				local link = GetContainerItemLink(bag, slot)
+				bonus = bonus + QuickFarm_GetItemSkillBonus(link, skillName)
+			end
+		end
+	end
+	return base + bonus, base, bonus
 end
 
 -- ------------------------------------------------------------
@@ -161,7 +307,13 @@ function QuickFarm_DoForwardSwap()
 
 	local didSwap = false
 
-	for slotKey, invSlot in pairs(QUICKFARM_SLOTID) do
+	-- Fixed order, not pairs()'s undefined table order: mainhand MUST be
+	-- handled before offhand, so the two-hander check below always sees
+	-- this pass's own mainhand change (see QuickFarm_EquipOffhandSafely).
+	local QUICKFARM_SLOT_ORDER = { "gloves", "mainhand", "offhand" }
+
+	for _, slotKey in ipairs(QUICKFARM_SLOT_ORDER) do
+		local invSlot = QUICKFARM_SLOTID[slotKey]
 		local cfg = QuickFarmDB.slots[slotKey]
 		if cfg and cfg.itemName and cfg.itemName ~= "" then
 			local found = QuickFarm_FindItemInBags(cfg.itemName)
@@ -172,6 +324,11 @@ function QuickFarm_DoForwardSwap()
 				-- Remember it and try again the moment combat ends.
 				QuickFarmDB.pending.forwardWaiting[slotKey] = cfg.itemName
 				QuickFarm_Print(slotKey .. " swap skipped (in combat) - will swap as soon as combat ends.")
+			elseif slotKey == "offhand" then
+				-- Two-hander-aware equip - see QuickFarm_EquipOffhandSafely.
+				QuickFarm_EquipOffhandSafely(cfg.itemName)
+				QuickFarmDB.pending.forwardWaiting[slotKey] = nil
+				didSwap = true
 			else
 				-- Snapshot current item BEFORE swapping, every single time,
 				-- so a respec/gear change during the evening is always respected.
@@ -201,7 +358,10 @@ function QuickFarm_RetrySlots()
 		return
 	end
 
-	for slotKey, invSlot in pairs(QUICKFARM_SLOTID) do
+	local QUICKFARM_SLOT_ORDER = { "gloves", "mainhand", "offhand" }
+
+	for _, slotKey in ipairs(QUICKFARM_SLOT_ORDER) do
+		local invSlot = QUICKFARM_SLOTID[slotKey]
 		local cfg = QuickFarmDB.slots[slotKey]
 		if cfg and cfg.itemName and cfg.itemName ~= "" then
 			local current = QuickFarm_GetEquippedName(invSlot)
@@ -209,6 +369,16 @@ function QuickFarm_RetrySlots()
 				if QuickFarm_InCombat and QUICKFARM_COMBAT_LOCKED[slotKey] then
 					-- Still can't do this one right now.
 					QuickFarmDB.pending.forwardWaiting[slotKey] = cfg.itemName
+				elseif slotKey == "offhand" then
+					local found = QuickFarm_FindItemInBags(cfg.itemName)
+					if found then
+						-- Two-hander-aware equip - see QuickFarm_EquipOffhandSafely.
+						QuickFarm_EquipOffhandSafely(cfg.itemName)
+						if QuickFarmDB.pending.forwardWaiting[slotKey] then
+							QuickFarm_Print(slotKey .. " swapped successfully now that combat has ended.")
+						end
+						QuickFarmDB.pending.forwardWaiting[slotKey] = nil
+					end
 				else
 					local found = QuickFarm_FindItemInBags(cfg.itemName)
 					if found then
@@ -322,8 +492,25 @@ eventFrame:SetScript("OnEvent", function()
 		if type(arg1) == "number" then
 			msg = arg2
 		end
-		if QuickFarm_IsSkinningSkillError(msg) then
-			QuickFarm_DoForwardSwap()
+		local isMatch, skillName, required = QuickFarm_ParseSkillError(msg)
+		if isMatch then
+			if QuickFarmDB.pending.active then
+				-- We're already wearing the swapped gear and STILL got this error -
+				-- confirm the swap is active, tell the user gear alone won't fix
+				-- it, and swap back (no point staying in the gear any longer).
+				QuickFarm_Print("Confirmed: gear swap is currently active.")
+				QuickFarm_Error(skillName .. " skill is still too low even with your swapped gear equipped - swapping back.")
+				QuickFarm_DoBackwardSwap()
+			else
+				-- Not swapped yet - check FIRST whether swapping would even be
+				-- enough before touching any gear at all.
+				local projected = QuickFarm_GetProjectedSkill(skillName)
+				if projected < required then
+					QuickFarm_Error("Did not swap - even with your gear you'd only have " .. skillName .. " " .. projected .. "/" .. required .. ".")
+				else
+					QuickFarm_DoForwardSwap()
+				end
+			end
 		end
 
 	elseif event == "LOOT_CLOSED" then
