@@ -165,6 +165,10 @@ different/tougher mob). In that case the addon:
 Slash commands:
 - `/qf status` — prints enabled/disabled, whether a swap is currently pending, and combat state.
 - `/qf back` — forces an immediate backward swap attempt right now (still respects the combat check).
+- `/qf scan` — debug command: for each configured slot, prints whether the
+  item was found (equipped / in bags / not found), then prints the
+  projected Skinning and Mining totals (base + gear bonus). Use this to
+  diagnose why a `+N Skinning`/`+N Mining` bonus isn't being counted.
 
 ---
 
@@ -267,6 +271,25 @@ popup — an unconfigured slot is simply not swapped.
 ---
 
 ## Change log
+- v1.6 — Broadened tooltip bonus matching in `QuickFarm_GetItemSkillBonus` to
+  handle more wordings: case-insensitive matching, plus "Skinning +10"
+  (reversed order) and "increases Skinning by 10" in addition to the
+  original "+10 Skinning". Added a new debug slash command `/qf scan`
+  that prints, for each configured slot, whether the item was found
+  (equipped / in bags / not found) and the resulting projected
+  Skinning/Mining totals - for diagnosing cases where a bonus still
+  isn't being picked up.
+- v1.5 — Fixed `QuickFarm_GetProjectedSkill` missing item bonuses for gear that's
+  already equipped. The skill pre-check only searched your bags for the
+  configured items - if a piece (e.g. the weapon) was already worn, it was
+  never found, so its `+N Skinning`/`+N Mining` bonus was silently skipped,
+  making the projected skill look lower than it really is. Now it checks
+  the equipped slot first and only falls back to searching bags.
+- v1.4 — Fixed "unknown link type" error in `QuickFarm_GetItemSkillBonus`. `SetHyperlink`
+  needs only the raw `item:1234:0:0:0` data, not the full colored/bracketed
+  link string - it now extracts that part (the text between `|H` and `|h`)
+  before calling `SetHyperlink`. This only affected the skill pre-check's
+  tooltip scanning, not the actual gear swap.
 - v1.3 — Added the skill pre-check: before swapping, the addon now reads the
   required skill number straight out of the error message
   (`QuickFarm_ParseSkillError`), computes the player's bare skill rank plus

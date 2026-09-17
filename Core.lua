@@ -241,14 +241,29 @@ local QuickFarmScanTooltip = CreateFrame("GameTooltip", "QuickFarmScanTooltip", 
 -- tooltip for the given skillName. Returns 0 if no such line is found.
 local function QuickFarm_GetItemSkillBonus(itemLink, skillName)
 	if not itemLink then return 0 end
+	-- SetHyperlink wants only the "item:1234:0:0:0" part, not the full
+	-- colored/bracketed link string - pull it out from between |H and |h.
+	local linkData = string.match(itemLink, "|H(.-)|h")
+	if not linkData then return 0 end
 	QuickFarmScanTooltip:SetOwner(UIParent, "ANCHOR_NONE")
-	QuickFarmScanTooltip:SetHyperlink(itemLink)
+	QuickFarmScanTooltip:SetHyperlink(linkData)
 	local numLines = QuickFarmScanTooltip:NumLines()
+	local lowerSkill = string.lower(skillName)
 	for i = 1, numLines do
 		local fs = getglobal("QuickFarmScanTooltipTextLeft" .. i)
 		local text = fs and fs:GetText()
 		if text then
-			local bonus = string.match(text, "%+(%d+)%s+" .. skillName)
+			local lowerText = string.lower(text)
+			-- Try the common wording "+10 Skinning".
+			local bonus = string.match(lowerText, "%+(%d+)%s+" .. lowerSkill)
+			-- Try the reversed wording "Skinning +10".
+			if not bonus then
+				bonus = string.match(lowerText, lowerSkill .. "%s*%+(%d+)")
+			end
+			-- Try "increases skinning (skill) by 10".
+			if not bonus then
+				bonus = string.match(lowerText, "increases%s+" .. lowerSkill .. ".-by%s+(%d+)")
+			end
 			if bonus then
 				QuickFarmScanTooltip:Hide()
 				return tonumber(bonus)
@@ -278,11 +293,22 @@ end
 function QuickFarm_GetProjectedSkill(skillName)
 	local base = QuickFarm_GetSkillBase(skillName)
 	local bonus = 0
-	for _, cfg in pairs(QuickFarmDB.slots) do
+	for slotKey, cfg in pairs(QuickFarmDB.slots) do
 		if cfg and cfg.itemName and cfg.itemName ~= "" then
-			local found, _, bag, slot = QuickFarm_FindItemInBags(cfg.itemName)
-			if found then
-				local link = GetContainerItemLink(bag, slot)
+			local invSlot = QUICKFARM_SLOTID[slotKey]
+			local link = nil
+			-- If the configured item is already equipped in this slot, read the
+			-- bonus straight off the equipped item - it won't be found in bags.
+			local equippedName = invSlot and QuickFarm_GetEquippedName(invSlot)
+			if equippedName and string.lower(equippedName) == string.lower(cfg.itemName) then
+				link = GetInventoryItemLink("player", invSlot)
+			else
+				local found, _, bag, slot = QuickFarm_FindItemInBags(cfg.itemName)
+				if found then
+					link = GetContainerItemLink(bag, slot)
+				end
+			end
+			if link then
 				bonus = bonus + QuickFarm_GetItemSkillBonus(link, skillName)
 			end
 		end
@@ -546,6 +572,30 @@ SlashCmdList["QUICKFARM"] = function(msg)
 	if msg == "back" then
 		QuickFarm_Print("Manual swap-back requested.")
 		QuickFarm_DoBackwardSwap()
+	elseif msg == "scan" then
+		-- Debug: shows exactly what the addon found for each configured slot,
+		-- and the resulting projected skill totals. Use this to figure out why
+		-- a bonus isn't being counted.
+		for slotKey, cfg in pairs(QuickFarmDB.slots) do
+			if cfg and cfg.itemName and cfg.itemName ~= "" then
+				local invSlot = QUICKFARM_SLOTID[slotKey]
+				local equippedName = invSlot and QuickFarm_GetEquippedName(invSlot)
+				local location = "NOT FOUND (check spelling)"
+				if equippedName and string.lower(equippedName) == string.lower(cfg.itemName) then
+					location = "equipped"
+				else
+					local found = QuickFarm_FindItemInBags(cfg.itemName)
+					if found then
+						location = "in bags"
+					end
+				end
+				QuickFarm_Print(slotKey .. " = '" .. cfg.itemName .. "' -> " .. location)
+			end
+		end
+		for _, skillName in ipairs({ "Skinning", "Mining" }) do
+			local projected, base, bonus = QuickFarm_GetProjectedSkill(skillName)
+			QuickFarm_Print(skillName .. ": base " .. base .. " + gear bonus " .. bonus .. " = " .. projected)
+		end
 	else
 		QuickFarm_Print("Enabled: " .. tostring(QuickFarmDB.enabled)
 			.. " | Pending swap: " .. tostring(QuickFarmDB.pending.active)
